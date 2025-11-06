@@ -1,441 +1,302 @@
-# streaming_protocol.py
-# Online streaming protocol for BATS: build Normal→Anomaly→Normal streams,
-# maintain stateful inference, apply online decisions, and compute early-detection metrics.
-# Author: Changyu Li
-
-from __future__ import annotations
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Any
-from dataclasses import dataclass
-
-import math
-import random
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from bats_module import BATSModel, StreamingState
-
-Tensor = torch.Tensor
-
-
-# Configs
-
-
-@dataclass
-class StreamConfig:
-    """
-    Online decision & stream configuration.
-    - ema_alpha: score exponential smoothing factor in [0,1). Larger = smoother.
-    - on_thresh/off_thresh: hysteresis thresholds (on >= off). on triggers alarm, off clears it.
-    - cooldown: frames to suppress new alarms after one alarm ends (avoid chatter).
-    - max_frames: optional truncation for the stream.
-    - noise_std: additive Gaussian noise sigma in [0,1] image scale, 0 disables.
-    - brightness_drift: per-frame brightness drift (added each frame), 0 disables.
-    - device: inference device.
-    """
-    ema_alpha: float = 0.9
-    on_thresh: float = 0.6
-    off_thresh: float = 0.5
-    cooldown: int = 5
-    max_frames: Optional[int] = None
-
-    noise_std: float = 0.0
-    brightness_drift: float = 0.0
-
-    device: str = "cuda"
-
-
-
-# Perturbations (export-friendly, training-time only)
-
-
-def apply_perturbations(img: Tensor, frame_idx: int, cfg: StreamConfig) -> Tensor:
-    """
-    Apply simple robustness perturbations in image space (float, 0..1).
-    - Gaussian noise with std = cfg.noise_std
-    - Linear brightness drift: add frame_idx * brightness_drift (then clamp)
-    """
-    x = img
-    if cfg.brightness_drift != 0.0:
-        x = x + float(frame_idx) * cfg.brightness_drift
-    if cfg.noise_std > 0.0:
-        x = x + torch.randn_like(x) * cfg.noise_std
-    return x.clamp(0.0, 1.0)
-
-
-# Online decision with EMA + hysteresis + cooldown
-
-
-class OnlineDecision:
-    """
-    Maintains smoothed score and produces binary alarms with hysteresis.
-    Hysteresis prevents flapping near a single threshold; cooldown prevents rapid re-triggers.
-    """
-    def __init__(self, ema_alpha: float, on_thresh: float, off_thresh: float, cooldown: int):
-        assert on_thresh >= off_thresh, "on_thresh must be >= off_thresh for hysteresis."
-        self.ema_alpha = float(ema_alpha)
-        self.on = float(on_thresh)
-        self.off = float(off_thresh)
-        self.cooldown = int(cooldown)
-
-        self.smoothed: Optional[Tensor] = None  # (B,)
-        self.state: Optional[Tensor] = None     # (B,) in {0,1}
-        self.cool: Optional[Tensor] = None      # (B,) cooldown counters
-
-    def reset(self, batch_size: int, device: torch.device):
-        self.smoothed = torch.zeros(batch_size, device=device)
-        self.state = torch.zeros(batch_size, dtype=torch.long, device=device)
-        self.cool = torch.zeros(batch_size, dtype=torch.long, device=device)
-
-    @torch.no_grad()
-    def step(self, score: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Update with new raw score in [0,1], return:
-          - state: (B,) current alarm state {0,1}
-          - rising: (B,) 1 where a new alarm just triggered at this step
-        """
-        assert score.dim() == 1, "score should be (B,) after reduce_map_to_score"
-        B = score.shape[0]
-        device = score.device
-        if self.smoothed is None:
-            self.reset(B, device)
-
-        # EMA smoothing
-        self.smoothed = self.ema_alpha * self.smoothed + (1.0 - self.ema_alpha) * score
-
-        # Apply cooldown decrement
-        self.cool = torch.clamp(self.cool - 1, min=0)
-
-        prev = self.state.clone()
-
-        # Hysteresis update per sample
-        turn_on = (self.smoothed >= self.on) & (self.cool == 0)
-        turn_off = (self.smoothed <= self.off)
-
-        self.state = torch.where(turn_on, torch.ones_like(self.state), self.state)
-        self.state = torch.where(turn_off, torch.zeros_like(self.state), self.state)
-
-        # When turning off, set cooldown
-        just_off = (prev == 1) & (self.state == 0)
-        self.cool = torch.where(just_off, torch.full_like(self.cool, self.cooldown), self.cool)
-
-        rising = (prev == 0) & (self.state == 1)
-        return self.state, rising.long()
-
-
-
-# Stream builders
-
-def sample_indices(n: int, length: int, replace: bool = False) -> List[int]:
-    """Sample 'length' indices from [0..n-1]."""
-    assert length > 0
-    if replace or length > n:
-        return [random.randrange(n) for _ in range(length)]
-    else:
-        return random.sample(range(n), length)
-
-class SimpleDatasetWrapper:
-    """
-    Minimal adapter that expects an underlying dataset returning:
-      - image: Tensor (C,H,W) in [0,1]
-      - mask:  Optional[Tensor] (1,H,W) in {0,1} or None
-      If your dataset returns (image, label) instead, set mask=None.
-    """
-    def __init__(self, base):
-        self.base = base
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx: int) -> Dict[str, Tensor]:
-        item = self.base[idx]
-        if isinstance(item, dict):
-            img = item.get("image") or item.get("img")
-            mask = item.get("mask")  # can be None
-        elif isinstance(item, (tuple, list)):
-            # try (image, mask) or (image,) convention
-            img = item[0]
-            mask = item[1] if len(item) > 1 else None
-        else:
-            img = item
-            mask = None
-        return {"image": img, "mask": mask}
-
-class StreamingConcat:
-    """
-    Build a stream by concatenating:
-      [Normal-prefix] + [Anomaly] + [Normal-suffix]
-
-    Each segment is sampled from given datasets with specified lengths.
-    This class yields dicts with:
-      - 'image': (C,H,W) in [0,1]
-      - 'mask':  Optional (1,H,W) in {0,1}
-      - 'label': 0 for normal, 1 for anomaly
-      - 'frame_idx': global frame index in the stream
-    """
-    def __init__(
-        self,
-        normal_ds,
-        anomaly_ds,
-        len_prefix: int,
-        len_anomaly: int,
-        len_suffix: int,
-        shuffle_each_segment: bool = True
-    ):
-        self.normal = SimpleDatasetWrapper(normal_ds)
-        self.anomaly = SimpleDatasetWrapper(anomaly_ds)
-        self.Ln1 = int(len_prefix)
-        self.La = int(len_anomaly)
-        self.Ln2 = int(len_suffix)
-        self.shuffle_each_segment = shuffle_each_segment
-
-        self.norm_idx1 = sample_indices(len(self.normal), self.Ln1, replace=len(self.normal) < self.Ln1)
-        self.anom_idx = sample_indices(len(self.anomaly), self.La, replace=len(self.anomaly) < self.La)
-        self.norm_idx2 = sample_indices(len(self.normal), self.Ln2, replace=len(self.normal) < self.Ln2)
-
-        if shuffle_each_segment:
-            random.shuffle(self.norm_idx1)
-            random.shuffle(self.anom_idx)
-            random.shuffle(self.norm_idx2)
-
-        self.total = self.Ln1 + self.La + self.Ln2
-
-    def __len__(self):
-        return self.total
-
-    def __iter__(self) -> Iterator[Dict[str, Tensor]]:
-        frame = 0
-        # Normal prefix
-        for i in self.norm_idx1:
-            item = self.normal[i]
-            yield {"image": item["image"], "mask": item["mask"], "label": torch.tensor(0), "frame_idx": frame}
-            frame += 1
-        # Anomaly
-        for i in self.anom_idx:
-            item = self.anomaly[i]
-            yield {"image": item["image"], "mask": item["mask"], "label": torch.tensor(1), "frame_idx": frame}
-            frame += 1
-        # Normal suffix
-        for i in self.norm_idx2:
-            item = self.normal[i]
-            yield {"image": item["image"], "mask": item["mask"], "label": torch.tensor(0), "frame_idx": frame}
-            frame += 1
-
-
-
-# Metrics: MTTD, FAR, Fragmentation
-
-
-@dataclass
-class OnlineMetrics:
-    """Container for online metrics."""
-    mttd: Optional[float]            # mean time-to-detect (frames), or None if never detected
-    far_per_1k: float                # false alarms per 1000 normal frames
-    fragmentation: float             # number of on→off transitions per 1000 frames (lower is better)
-    detections: int                  # number of alarm onsets
-    total_frames: int
-
-def compute_online_metrics(
-    labels: List[int],
-    rising_events: List[int],
-    states: List[int]
-) -> OnlineMetrics:
-    """
-    Compute online metrics using per-frame:
-      - labels[t] in {0,1}
-      - rising_events[t] in {0,1} (new alarm triggered at t)
-      - states[t] in {0,1} (current alarm state)
-    MTTD: min (t_rise - t_anom_onset) per anomaly episode, averaged across episodes detected.
-    FAR: ratio of rising events that occur during normal frames, normalized per 1k normal frames.
-    Fragmentation: number of off→on transitions per 1k frames (overall chattiness).
-    """
-    T = len(labels)
-    # Find anomaly onset frames
-    onsets = []
-    prev = 0
-    for t, y in enumerate(labels):
-        if y == 1 and prev == 0:
-            onsets.append(t)
-        prev = y
-
-    # For each onset, find first rising event at or after onset
-    delays = []
-    rise_indices = [t for t, r in enumerate(rising_events) if r == 1]
-    for onset in onsets:
-        det = next((t for t in rise_indices if t >= onset), None)
-        if det is not None:
-            delays.append(det - onset)
-
-    mttd = (sum(delays) / len(delays)) if len(delays) > 0 else None
-
-    # FAR per 1k normal frames
-    normal_frames = sum(1 for y in labels if y == 0)
-    false_rises = sum(1 for t, r in enumerate(rising_events) if r == 1 and labels[t] == 0)
-    far_per_1k = (false_rises / max(1, normal_frames)) * 1000.0
-
-    # Fragmentation per 1k frames: count off->on transitions (regardless of label)
-    on_transitions = 0
-    prev_state = 0
-    for s in states:
-        if prev_state == 0 and s == 1:
-            on_transitions += 1
-        prev_state = s
-    fragmentation = (on_transitions / max(1, T)) * 1000.0
-
-    return OnlineMetrics(
-        mttd=mttd,
-        far_per_1k=far_per_1k,
-        fragmentation=fragmentation,
-        detections=on_transitions,
-        total_frames=T
-    )
-
-
-# Stream runner (model + state + decision + metrics)
-
-
-class StreamRunner:
-    """
-    Run a BATSModel on a streaming iterator frame-by-frame, maintaining:
-      - model StreamingState (features across time)
-      - OnlineDecision (score smoothing & hysteresis)
-      - Optional perturbations for robustness tests
-    Produces per-frame records and summary metrics.
-    """
-    def __init__(self, model: BATSModel, cfg: StreamConfig):
-        self.model = model.eval()
-        self.cfg = cfg
-
-    @torch.inference_mode()
-    def run(self, stream: Iterable[Dict[str, Tensor]]) -> Dict[str, Any]:
-        device = torch.device(self.cfg.device if torch.cuda.is_available() else "cpu")
-        self.model.to(device)
-
-        state = self.model.new_streaming_state()
-        decider = OnlineDecision(
-            ema_alpha=self.cfg.ema_alpha,
-            on_thresh=self.cfg.on_thresh,
-            off_thresh=self.cfg.off_thresh,
-            cooldown=self.cfg.cooldown
-        )
-
-        records: Dict[str, List[Any]] = {
-            "score": [], "score_ema": [], "alarm": [], "rising": [],
-            "latency_ms": [], "label": [], "frame_idx": []
-        }
-
-        B = None
-        t_global = 0
-        for item in stream:
-            if self.cfg.max_frames is not None and t_global >= self.cfg.max_frames:
-                break
-
-            img = item["image"].unsqueeze(0).to(device)  # (1,C,H,W)
-            if img.dtype != torch.float32:
-                img = img.float()
-            # Assume input in 0..1; apply perturbations if requested
-            img = apply_perturbations(img, t_global, self.cfg)
-
-            # Forward
-            out = self.model(
-                images=img,
-                budget=self.model.default_budget_q,
-                budget_mode=self.model.default_budget_mode,
-                streaming_state=state,
-                return_feats=False,
-                measure_latency=True
-            )
-            score = out["score"].detach()  # (1,)
-            latency = float(out.get("latency_ms", 0.0))
-
-            # Decision update
-            alarm_state, rising = decider.step(score)
-            if B is None:
-                B = int(score.shape[0])
-                decider.reset(B, device)
-
-            # Bookkeeping
-            records["score"].append(float(score[0].item()))
-            records["score_ema"].append(float(decider.smoothed[0].item()))
-            records["alarm"].append(int(alarm_state[0].item()))
-            records["rising"].append(int(rising[0].item()))
-            records["latency_ms"].append(latency)
-            records["label"].append(int(item["label"]))
-            records["frame_idx"].append(int(item["frame_idx"]))
-
-            t_global += 1
-
-        # Metrics
-        metrics = compute_online_metrics(
-            labels=records["label"],
-            rising_events=records["rising"],
-            states=records["alarm"]
-        )
-
-        return {"records": records, "metrics": metrics}
-
-# Minimal smoke test (no external dataset required)
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Dummy "datasets": constant gray images, anomaly masks only in anomaly part
-    class DummyDS:
-        def __init__(self, length: int, anomaly: bool = False):
-            self.length = length
-            self.anomaly = anomaly
-        def __len__(self): return self.length
-        def __getitem__(self, idx):
-            img = torch.full((3, 128, 128), 0.5, dtype=torch.float32)  # 0.5 gray
-            mask = torch.zeros(1, 128, 128, dtype=torch.float32)
-            if self.anomaly:
-                # put a small bright blob as "anomaly"
-                y0, x0, r = 64, 64, 10
-                Y, X = torch.meshgrid(torch.arange(128), torch.arange(128), indexing="ij")
-                blob = (((Y - y0)**2 + (X - x0)**2) <= r**2).float()
-                img = img + blob.unsqueeze(0) * 0.4
-                mask = blob.unsqueeze(0)
-            return {"image": img.clamp(0,1), "mask": mask}
-
-    normal_ds = DummyDS(200, anomaly=False)
-    anomaly_ds = DummyDS(60, anomaly=True)
-
-    stream = StreamingConcat(
-        normal_ds, anomaly_ds,
-        len_prefix=120, len_anomaly=40, len_suffix=80,
-        shuffle_each_segment=False
-    )
-
-    # Light BATS stub if you don't have the full model here:
-    try:
-        model = BATSModel(
-            backbone_cfg="nano",    # smaller for the test
-            use_budget=False,       # focus on protocol
-            use_spectral_reg=False
-        ).to(device)
-    except Exception as e:
-        print("If BATSModel is unavailable, replace with a stub producing 'score' & 'latency_ms'.")
-        raise e
-
-    cfg = StreamConfig(
-        ema_alpha=0.9,
-        on_thresh=0.6,
-        off_thresh=0.5,
-        cooldown=10,
-        max_frames=None,
-        noise_std=0.00,
-        brightness_drift=0.0,
-        device=device
-    )
-
-    runner = StreamRunner(model, cfg)
-    out = runner.run(stream)
-
-    print("Online metrics:")
-    m = out["metrics"]
-    print(f"  MTTD (frames): {m.mttd}")
-    print(f"  FAR (/1k normal frames): {m.far_per_1k:.2f}")
-    print(f"  Fragmentation (/1k frames): {m.fragmentation:.2f}")
-    print(f"  Detections: {m.detections}, Total frames: {m.total_frames}")
+# BATS: Budget-Adaptive Tiny-Mamba for Streaming Visual Anomaly Detection
+
+> **Anytime inference under tight latency on edge devices.**  
+> BATS couples a Tiny-Mamba vision backbone with a budget controller (token keep/merge) and a spectral-consistency regularizer to achieve early, stable anomaly detection in streaming industrial imagery.
+
+[![License: CC BY 4.0](https://img.shields.io/badge/License-CC_BY_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red)
+![Status](https://img.shields.io/badge/Status-CVPR--style--code--release-brightgreen)
+
+**Repository**: https://github.com/Changyu-Li021230/BATS  
+**Paper target**: CVPR 2026 (Streaming AD / Efficient Vision)
+
+---
+
+## ✨ Highlights
+
+- **Anytime inference**: continuous budget–accuracy trade-off via token **keep** (sparse masking) or **merge** (resolution reduction).  
+- **Streaming stability**: **SpectralConsistency** aligns temporal frequency responses across scales → fewer flickers/fragmentation & more stable MTTD.  
+- **Edge-friendly**: tiny backbone + FPN, export-safe ops (dw-conv/1×1/avg-pool), easy to port to Jetson/TensorRT.
+
+---
+
+## 👥 Authors & Maintainers
+
+- **Changyu Li** (GitHub: `@Changyu-Li021230`) — lead author & maintainer  
+- **Jiaxin Chen** — co-author  
+- **Fei Luo** — co-author / advisor
+
+> Contact: please open a GitHub issue for bug reports or feature requests.
+
+---
+
+## 🧠 Method at a Glance
+
+- **Backbone — `TinyMambaBackbone`**  
+  Lightweight 2D selective-scan block (Mamba-style SSM) with local depthwise mixing and content-gated row/column scans; emits `{C2..C5, P3..P5}` via FPN.
+
+- **Budget Controller — `BudgetController` (on `{P3,P4,P5}`)**  
+  - **keep**: Top-k saliency masking (keeps spatial size; decoder-friendly).  
+  - **merge**: non-overlapping average pooling to approximate a target token count (ToMe-like, export-safe).
+
+- **Spectral Consistency — `SpectralConsistency`**  
+  Welch rFFT over temporal buffers; enforces cross-scale spectral coherence, optional physics-band priors; reduces jitter & alarm fragmentation.
+
+- **Head**  
+  Shallow pixel head on **P3** → per-pixel anomaly maps; per-image score via top-k pooling.
+
+---
+
+## 🗂️ Repository Structure
+
+```
+bats_backbone.py          # Tiny-Mamba + FPN backbone
+budget_controller.py      # Budget-adaptive keep/merge for P3/P4/P5
+spectral_consistency.py   # Spectral regularizer for streaming stability
+bats_module.py            # End-to-end model + loss + (optional) LightningModule
+streaming_protocol.py     # Online protocol, decisions, metrics, stream builder
+eval_stream.py            # CVPR-ready evaluation across a budget grid
+```
+
+---
+
+## 🛠️ Installation
+
+```bash
+# Python 3.10+ recommended
+conda create -n bats python=3.10 -y
+conda activate bats
+
+# Install PyTorch matching your CUDA/CPU
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Core deps
+pip install numpy pillow
+
+# Optional (Lightning)
+pip install pytorch-lightning
+
+# Optional (plotting, out of repo)
+pip install matplotlib pandas
+```
+
+**Tested environments**
+- Python 3.10/3.11, PyTorch 2.2–2.4, CUDA 12.x  
+- Linux x86_64 + NVIDIA GPU; Jetson Orin via export (see Export section)
+
+---
+
+## ⚡ Quick Start
+
+### 1) Smoke test
+```bash
+python bats_module.py
+```
+You should see a dummy forward/loss and one-pass latency readout.
+
+### 2) Streaming evaluation (folder-based toy example)
+Prepare two folders of RGB images:
+- `normal_dir` — normal frames
+- `anomaly_dir` — anomaly frames
+
+```bash
+python eval_stream.py \
+  --normal_dir /path/to/normal_images \
+  --anomaly_dir /path/to/anomaly_images \
+  --use_budget --mode keep \
+  --budgets 1.0 0.75 0.5 0.3 0.2 0.1 \
+  --repeat 5 --len_prefix 120 --len_anomaly 40 --len_suffix 80 \
+  --amp --warmup_iters 30 \
+  --out_dir outputs/eval_stream_keep
+```
+
+Outputs (CSV/JSON) → `outputs/eval_stream_keep/`:
+- `frames_q*.csv` — per-frame scores, alarms, latency  
+- `streams_q*.csv` — per-stream MTTD/FAR/Fragmentation/latency quantiles/AUROC  
+- `summary.csv` & `summary.json` — aggregated results per budget
+
+---
+
+## 📊 Streaming Evaluation
+
+`streaming_protocol.py` provides:
+- **Stream builder**: `StreamingConcat` to create **Normal → Anomaly → Normal** sequences  
+- **State**: `StreamingState` buffers features and optional mask-EMA  
+- **Decision**: `OnlineDecision` with EMA + hysteresis + cooldown  
+- **Metrics**: **MTTD**, **FAR**, **Fragmentation**, **e2e latency** (p50/p90/p99)
+
+Switch budget mode:
+```bash
+# keep-mode (sparse masking, same resolution)
+python eval_stream.py --mode keep --use_budget ...
+
+# merge-mode (avg-pool merge, fewer tokens)
+python eval_stream.py --mode merge --use_budget ...
+```
+
+---
+
+## 🧪 Training Hooks (Optional)
+
+Minimal BCE supervision is provided for pixel masks; spectral regularizer can be enabled for stability.
+
+```python
+from bats_module import BATSModel
+model = BATSModel(
+    backbone_cfg="tiny",
+    use_budget=True,
+    default_budget_q=1.0,
+    default_budget_mode="keep",
+    use_spectral_reg=True,
+    spectral_kwargs=dict(win_sizes=[16,32], hop_ratio=0.25,
+                         lambda_coh=1.0, lambda_band=0.0, lambda_smooth=0.0)
+).to(device)
+
+stream_state = model.new_streaming_state()
+out = model(images.to(device), budget=None, budget_mode=None,
+            streaming_state=stream_state, measure_latency=False)
+losses = model.compute_loss(out, gt_mask=gt_mask.to(device), streaming_state=stream_state)
+(losses["loss"]).backward()
+```
+
+Lightning users: use `BATSSystem` in `bats_module.py`.
+
+---
+
+## 🎛️ Budgets & Modes
+
+- **Budget** `q ∈ (0,1]` — target token fraction per pyramid level (allocated by level weights).  
+- **keep**: Top-k saliency mask, preserve spatial size; best drop-in for conv decoders.  
+- **merge**: non-overlapping avg-pool to ~target tokens; reduces spatial size & compute.
+
+For **anytime inference**, randomize budgets during training and evaluate across a grid.
+
+---
+
+## 📐 CLI Arguments (eval_stream.py)
+
+| Argument | Type | Default | Description |
+|---|---:|:---:|---|
+| `--normal_dir` | str | – | Folder with normal frames (RGB). |
+| `--anomaly_dir` | str | – | Folder with anomaly frames (RGB). |
+| `--len_prefix` | int | 120 | Normal prefix length. |
+| `--len_anomaly` | int | 40 | Anomaly segment length. |
+| `--len_suffix` | int | 80 | Normal suffix length. |
+| `--repeat` | int | 5 | How many streams to build. |
+| `--budgets` | float+ | `1.0 0.75 0.5 0.3 0.2 0.1` | Budget list (q). |
+| `--mode` | str | `keep` | `keep` or `merge`. |
+| `--use_budget` | flag | off | Enable budget controller. |
+| `--ema_alpha` | float | 0.9 | Score EMA smoothing factor. |
+| `--on_thresh` | float | 0.6 | Hysteresis ON threshold. |
+| `--off_thresh` | float | 0.5 | Hysteresis OFF threshold. |
+| `--cooldown` | int | 10 | Cooldown frames after alarm. |
+| `--noise_std` | float | 0.0 | Additive Gaussian noise (0..1 img scale). |
+| `--brightness_drift` | float | 0.0 | Per-frame brightness drift. |
+| `--device` | str | `cuda` | Device for inference. |
+| `--seed` | int | 2026 | RNG seed. |
+| `--out_dir` | str | `outputs/eval_stream` | Output directory. |
+| `--backbone_cfg` | str | `tiny` | `nano` \| `tiny` \| `small`. |
+| `--use_spec` | flag | off | Enable spectral regularizer (train-time only). |
+| `--amp` | flag | off | Use AMP during inference for latency runs. |
+| `--warmup_iters` | int | 0 | Warmup iterations before timing. |
+
+---
+
+## 🔁 Reproducibility & Latency Reporting
+
+- Fix seeds: `--seed` sets Python/NumPy/PyTorch RNGs.  
+- Stable latency: use `--amp` & `--warmup_iters` (e.g., 30–50); report **e2e latency** with p50/p90/p99.  
+- Keep `spectral_consistency` **off** at export/inference; it’s a **training-time** regularizer.
+
+---
+
+## 📦 Export (ONNX / TensorRT) — Sketch
+
+BATS uses export-safe ops (conv, depthwise, avg-pool, 1×1, simple elementwise). Typical steps:
+
+```python
+# 1) Switch model to eval; disable spectral regularizer
+model = BATSModel(backbone_cfg="tiny", use_budget=True, use_spectral_reg=False).eval().to("cuda")
+
+# 2) Dummy input
+dummy = torch.randn(1, 3, 256, 256, device="cuda")
+
+# 3) ONNX export (keep-mode default; set q=1.0 for a fixed graph if preferred)
+torch.onnx.export(
+    model, (dummy,), "bats.onnx",
+    input_names=["images"], output_names=["anom_map","logits","score"],
+    opset_version=17, dynamic_axes={"images": {0:"B", 2:"H", 3:"W"}}
+)
+```
+
+> TensorRT: import `bats.onnx`, enable FP16, set workspace; consider fusing the head & post-proc where convenient.  
+> Jetson: prefer `--mode keep` + fixed `q` for a stable graph (or calibrate INT8 after reviewing quality impact).
+
+---
+
+## 🧾 Dataset Notes
+
+Benchmarks to integrate:
+- **MVTec-AD** (15 classes, pixel masks)  
+- **VisA** (12 classes, 10k+ images)
+
+This repo’s script uses folder-based streams for simplicity. To get AUPRO/pixel PR:
+1) wrap your dataset to yield `(image, mask)` for `StreamingConcat`, or  
+2) adapt loaders from Anomalib and pass through `SimpleDatasetWrapper`.
+
+---
+
+## 📈 Results Placeholder (fill after experiments)
+
+- **Main table** (MVTec-AD / VisA): AUROC/AUPRO, Params, FLOPs, e2e Latency (p50/p90/p99)  
+- **Pareto frontier**: Latency(p99) or Params vs. AUPRO (multi-budget q)  
+- **Budget curves**: q → AUPRO, q → Latency  
+- **Streaming stability**: Detection-delay CDF, Fragmentation vs. baselines  
+- **Robustness**: AUPRO/MTTD retention under noise/blur/drift
+
+---
+
+## 🗺️ Roadmap / TODO
+
+- [ ] Multi-level fusion head (P3–P5) + lightweight decoder  
+- [ ] Native AUPRO / pixel-PR in `eval_stream.py`  
+- [ ] Jetson/TensorRT export recipe & benchmarks  
+- [ ] Per-class adapters (MVTec/VisA loaders)  
+- [ ] More robustness ops (blur, geometric drift, SNR curves)
+
+---
+
+## ❓ FAQ
+
+**Q1: Should I use `keep` or `merge`?**  
+`keep` preserves spatial size—plug-and-play with conv heads, often better early detection under small budgets. `merge` reduces resolution for more consistent speedups; validate on your data.
+
+**Q2: Where do I apply the spectral regularizer?**  
+Train time only, based on a temporal buffer of C5 features; disable for export/inference.
+
+**Q3: Any gotchas for latency measurement?**  
+Warm up (30–50 iters), fix seeds, match AMP setting to baselines, report p50/p90/p99, and clarify full e2e path (decode→preproc→model→postproc→decision).
+
+---
+
+## 📚 Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@inproceedings{Li2026BATS,
+  title     = {BATS: Budget-Adaptive Tiny-Mamba for Streaming Visual Anomaly Detection},
+  author    = {Changyu Li },
+  year      = {2026}
+}
+```
+
+*(Update once the paper is on arXiv/OpenReview.)*
+
+---
+
+## 📜 License & Acknowledgements
+
+- **License:** Code is released under **CC BY 4.0** (feel free to switch to MIT/BSD-3-Clause as needed).  
+- **Acknowledgements:** Inspired by state-space models (Mamba/VMamba), token selection/merging (DynamicViT/ToMe), and open anomaly detection tooling (e.g., Anomalib). Thanks to the open-source community.
