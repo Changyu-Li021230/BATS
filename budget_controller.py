@@ -1,5 +1,5 @@
 # budget_controller.py
-# Budget-adaptive token keep / merge for pyramid features (P3/P4/P5)
+# Budget-adaptive token keep / merge for pyramid features 
 # Author: Changyu Li
 
 from __future__ import annotations
