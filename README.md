@@ -17,9 +17,9 @@ from bats_module import BATSModel, StreamingState
 
 Tensor = torch.Tensor
 
-# --------------------------------------------------------------------------------------
+
 # Configs
-# --------------------------------------------------------------------------------------
+
 
 @dataclass
 class StreamConfig:
@@ -45,9 +45,9 @@ class StreamConfig:
     device: str = "cuda"
 
 
-# --------------------------------------------------------------------------------------
+
 # Perturbations (export-friendly, training-time only)
-# --------------------------------------------------------------------------------------
+
 
 def apply_perturbations(img: Tensor, frame_idx: int, cfg: StreamConfig) -> Tensor:
     """
@@ -63,9 +63,8 @@ def apply_perturbations(img: Tensor, frame_idx: int, cfg: StreamConfig) -> Tenso
     return x.clamp(0.0, 1.0)
 
 
-# --------------------------------------------------------------------------------------
 # Online decision with EMA + hysteresis + cooldown
-# --------------------------------------------------------------------------------------
+
 
 class OnlineDecision:
     """
@@ -124,9 +123,8 @@ class OnlineDecision:
         return self.state, rising.long()
 
 
-# --------------------------------------------------------------------------------------
+
 # Stream builders
-# --------------------------------------------------------------------------------------
 
 def sample_indices(n: int, length: int, replace: bool = False) -> List[int]:
     """Sample 'length' indices from [0..n-1]."""
@@ -224,9 +222,9 @@ class StreamingConcat:
             frame += 1
 
 
-# --------------------------------------------------------------------------------------
+
 # Metrics: MTTD, FAR, Fragmentation
-# --------------------------------------------------------------------------------------
+
 
 @dataclass
 class OnlineMetrics:
@@ -293,9 +291,8 @@ def compute_online_metrics(
     )
 
 
-# --------------------------------------------------------------------------------------
 # Stream runner (model + state + decision + metrics)
-# --------------------------------------------------------------------------------------
+
 
 class StreamRunner:
     """
@@ -377,10 +374,8 @@ class StreamRunner:
 
         return {"records": records, "metrics": metrics}
 
-
-# --------------------------------------------------------------------------------------
 # Minimal smoke test (no external dataset required)
-# --------------------------------------------------------------------------------------
+
 
 if __name__ == "__main__":
     torch.manual_seed(0)
