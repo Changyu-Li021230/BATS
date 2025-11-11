@@ -9,7 +9,7 @@
 ![Status](https://img.shields.io/badge/Status-CVPR--style--code--release-brightgreen)
 
 **Repository**: https://github.com/Changyu-Li021230/BATS  
-**Paper target**: CVPR 2026 (Streaming AD / Efficient Vision)
+**Paper target**: ICML (Streaming AD / Efficient Vision)
 
 ---
 
